@@ -1,0 +1,26 @@
+# Node / UI build（ui/ 是 frontend/ 的构建产物，打包前生成）
+node_modules/
+ui/
+frontend/dist/
+npm-debug.log*
+
+# Rust sidecar
+target/
+backend/target/
+
+# DBX plugin dev/package artifacts
+.dbx-dev/
+.dbx-repository-signing-key.env
+*.dbxp
+*.artifact.json
+checksums.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+# TypeScript incremental build info
+tsconfig.tsbuildinfo
+*.tsbuildinfo

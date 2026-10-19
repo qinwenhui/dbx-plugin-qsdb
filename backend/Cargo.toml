@@ -1,0 +1,23 @@
+[package]
+name = "dbx-plugin-qsdb"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "QSDB sidecar for the DBX plugin cn.qinwh.qsdb"
+publish = false
+
+[workspace]
+
+[dependencies]
+# 本地 vendor 副本（crates.io 发布后改回版本依赖，见 vendor/dbx-plugin-sdk/README.md）
+dbx-plugin-sdk = { path = "vendor/dbx-plugin-sdk" }
+qsdb-client = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 与 DBX 宿主二进制体积对齐：默认 release 会留下 ~20MB 符号。
+# panic 保持 unwind——SDK 依赖 worker 线程边界把 panic 转成协议错误。
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

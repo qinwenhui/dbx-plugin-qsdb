@@ -1,0 +1,154 @@
+{
+  "$schema": "https://raw.githubusercontent.com/t8y2/dbx/main/plugins/manifest.schema.json",
+  "manifest_version": 1,
+  "id": "cn.qinwh.qsdb",
+  "name": "QSDB",
+  "version": "0.1.0",
+  "publisher": "qinwh",
+  "description": "Connect to QSDB and run analytical SQL with partitions, table size, large-result paging, and query cancellation.",
+  "icon": "assets/plugin.svg",
+  "source": "https://github.com/qinwenhui/dbx-plugin-qsdb",
+  "homepage": "https://github.com/qinwenhui/dbx-plugin-qsdb",
+  "engines": {
+    "dbx": ">=0.6.0",
+    "host_api": "^1.1"
+  },
+  "permissions": [
+    "host.workbench",
+    "host.events",
+    "host.storage"
+  ],
+  "entrypoints": {
+    "ui": {
+      "root": "ui",
+      "entry": "ui/index.html"
+    },
+    "backend": {
+      "protocol_versions": [1],
+      "transport": "stdio-jsonl",
+      "executable": "bin/dbx-plugin-qsdb"
+    }
+  },
+  "contributions": [
+    {
+      "type": "connection-provider",
+      "id": "cn.qinwh.qsdb.connection",
+      "label": "QSDB",
+      "icon": "assets/plugin.svg",
+      "database_type": "qsdb",
+      "description": "Connect to a QSDB instance.",
+      "fields": [
+        {
+          "key": "name",
+          "label": "Connection name",
+          "type": "text",
+          "binding": "name",
+          "required": true,
+          "placeholder": "Local QSDB"
+        },
+        {
+          "key": "host",
+          "label": "Host",
+          "type": "text",
+          "binding": "host",
+          "required": true,
+          "default": "127.0.0.1"
+        },
+        {
+          "key": "port",
+          "label": "Port",
+          "type": "number",
+          "binding": "port",
+          "default": 9430
+        },
+        {
+          "key": "database",
+          "label": "Default database",
+          "type": "text",
+          "binding": "database",
+          "placeholder": "default"
+        },
+        {
+          "key": "auth",
+          "label": "Authentication",
+          "type": "select",
+          "binding": "config",
+          "default": "none",
+          "options": [
+            { "label": "Anonymous", "value": "none" },
+            { "label": "Username / password", "value": "basic" },
+            { "label": "Bearer token", "value": "bearer" }
+          ]
+        },
+        {
+          "key": "username",
+          "label": "Username",
+          "type": "text",
+          "binding": "username",
+          "visible_when": { "field": "auth", "one_of": ["basic"] }
+        },
+        {
+          "key": "password",
+          "label": "Password",
+          "type": "password",
+          "binding": "password",
+          "visible_when": { "field": "auth", "one_of": ["basic"] }
+        },
+        {
+          "key": "token",
+          "label": "Token",
+          "type": "password",
+          "binding": "secret",
+          "visible_when": { "field": "auth", "one_of": ["bearer"] }
+        },
+        {
+          "key": "read_only",
+          "label": "Read-only workbench",
+          "type": "boolean",
+          "binding": "config",
+          "default": false
+        },
+        {
+          "key": "connect_timeout_secs",
+          "label": "Connect timeout (s)",
+          "type": "number",
+          "binding": "config",
+          "default": 10
+        }
+      ],
+      "workbench": "cn.qinwh.qsdb.main",
+      "capabilities": ["test", "connect", "disconnect"]
+    },
+    {
+      "type": "workbench",
+      "id": "cn.qinwh.qsdb.main",
+      "label": "QSDB",
+      "icon": "assets/plugin.svg"
+    }
+  ],
+  "localizations": {
+    "zh-CN": {
+      "name": "QSDB",
+      "description": "连接 QSDB，执行分析 SQL：分区与 generation、表大小、大结果分页、查询停止。",
+      "contributions": {
+        "cn.qinwh.qsdb.connection": {
+          "label": "QSDB",
+          "description": "连接一个 QSDB 实例。",
+          "fields": {
+            "name": { "label": "连接名称" },
+            "host": { "label": "主机" },
+            "port": { "label": "端口" },
+            "database": { "label": "默认数据库" },
+            "auth": { "label": "认证方式", "options": { "none": "匿名", "basic": "用户名 / 密码", "bearer": "Bearer Token" } },
+            "username": { "label": "用户名" },
+            "password": { "label": "密码" },
+            "token": { "label": "Token" },
+            "read_only": { "label": "只读工作台" },
+            "connect_timeout_secs": { "label": "连接超时（秒）" }
+          }
+        },
+        "cn.qinwh.qsdb.main": { "label": "QSDB" }
+      }
+    }
+  }
+}
