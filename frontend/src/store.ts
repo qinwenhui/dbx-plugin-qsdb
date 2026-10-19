@@ -2,7 +2,7 @@
 // 单例 reactive store；组件直接 import 使用。
 import { reactive, readonly } from "vue";
 import { api, invoke, InvokeError, onQueryEvent, onEnvChange, type DbxColumn, type DbxContext } from "./bridge";
-import { langFor, t, type Lang, type Messages } from "./i18n";
+import { langFor, t, humanBytes, type Lang, type Messages } from "./i18n";
 
 export type CellValue = null | boolean | number | string;
 
@@ -57,6 +57,10 @@ export interface QueryState {
   receipt: ExecReceipt | null;
   pages: Map<number, CellValue[][]>; // offset → 实际返回的行
   pending: Set<number>;
+  /** 前端列排序：激活时全量拉页 + 排序快照（sortView 取代 spool 翻页）。 */
+  sort: { col: number; dir: 1 | -1 } | null;
+  sortView: CellValue[][] | null;
+  sortPreparing: boolean;
 }
 
 interface HistoryItem {
@@ -91,6 +95,16 @@ const state = reactive({
   partitionsSize: null as { rows: number; partitionCount: number; bytes: number | null; bytesKnown: boolean } | null,
   partitionsLoading: false,
   partitionsError: "",
+  server: {
+    loading: false,
+    queries: [],
+    sessions: [],
+    sessionsError: "",
+    stats: null,
+    error: "",
+  } as ServerPanel,
+  lastFile: "", // 最近一次落盘文件（结果导出 / 脚本保存）绝对路径
+  density: "cozy" as "cozy" | "compact", // 结果网格行高
 });
 
 function setLocale(locale: string) {
@@ -103,6 +117,7 @@ function pushMessage(kind: "info" | "error" | "receipt", text: string) {
   state.messages.unshift({ kind, text, at: Date.now() });
   if (state.messages.length > 200) state.messages.pop();
 }
+export { pushMessage };
 
 function qsdbCodeOf(e: unknown): string {
   return e instanceof InvokeError ? (e.qsdbCode ?? "ERROR") : "ERROR";
@@ -143,6 +158,23 @@ async function loadDraft() {
   }
 }
 
+async function loadDensity() {
+  try {
+    const d = await api().storage.get("qsdb.density");
+    if (d === "cozy" || d === "compact") state.density = d;
+  } catch {
+    /* 非关键偏好 */
+  }
+}
+
+/** 切换结果网格密度（紧凑/舒适）并持久化。 */
+export function toggleDensity() {
+  state.density = state.density === "cozy" ? "compact" : "cozy";
+  api()
+    .storage.set("qsdb.density", state.density)
+    .catch(() => undefined);
+}
+
 let draftTimer: ReturnType<typeof setTimeout> | undefined;
 export function draftChanged(sql: string) {
   state.sql = sql;
@@ -173,6 +205,7 @@ export async function init() {
   }
   await loadHistory();
   await loadDraft();
+  void loadDensity();
   await bootstrapConnection();
 }
 
@@ -195,9 +228,10 @@ async function bootstrapConnection() {
 }
 
 export async function loadMeta() {
+  // 始终取全量（不带 database 过滤）：schema 树按库分组展示全部挂载；
+  // currentDb 只影响查询的默认库，不裁剪树。
   const meta = await invoke<{ databases: DbInfo[]; tables: TableInfo[] }>("qsdb/metadata", {
     connectionId: state.connectionId,
-    database: state.currentDb || undefined,
   });
   state.databases = meta.databases;
   state.tables = meta.tables;
@@ -207,9 +241,17 @@ export async function refresh() {
   try {
     state.info = await invoke<ServerInfo>("qsdb/server/info", { connectionId: state.connectionId });
     await loadMeta();
+    state.loadError = "";
   } catch (e) {
-    handleConnectionLoss(e);
+    if (!handleConnectionLoss(e)) {
+      state.loadError = messageOf(e);
+    }
   }
+}
+
+/** 元数据加载失败后的手动重试入口（UI 横幅按钮）。 */
+export function retryLoad() {
+  return bootstrapConnection();
 }
 
 function handleConnectionLoss(e: unknown): boolean {
@@ -241,6 +283,9 @@ function newQuery(queryId: string, sql: string): QueryState {
     receipt: null,
     pages: new Map(),
     pending: new Set(),
+    sort: null,
+    sortView: null,
+    sortPreparing: false,
   };
 }
 
@@ -249,31 +294,79 @@ export function isReadOnlySql(sql: string): boolean {
   return /^(select|with|show|explain|values|describe|desc)\b/i.test(sql.trim().replace(/^(--.*\n|#[^\n]*\n|\/\*[\s\S]*?\*\/)+/s, "").trimStart());
 }
 
-export async function runSql() {
-  const sql = state.sql.trim();
-  if (!sql) return;
-  if (state.query?.running) return;
-  if (state.info?.readOnly && !isReadOnlySql(sql)) {
-    pushMessage("error", state.t.readOnlyBlocked);
-    return;
-  }
-  const q = newQuery("", sql);
+/** 创建查询态并让 sidecar 启动；启动失败时错误落在 q.error（done=true）。 */
+async function startQuery(sqlText: string): Promise<QueryState> {
+  const q = newQuery("", sqlText);
   state.query = q;
   state.activeTab = "results";
   try {
     const r = await invoke<{ queryId: string }>("qsdb/query/start", {
       connectionId: state.connectionId,
-      sql,
+      sql: sqlText,
       database: state.currentDb || undefined,
     });
     q.queryId = r.queryId;
-    void saveHistory(sql);
+    void saveHistory(sqlText);
   } catch (e) {
     q.running = false;
     q.done = true;
     q.error = { code: qsdbCodeOf(e), message: messageOf(e) };
     pushMessage("error", `${q.error.code}: ${q.error.message}`);
     handleConnectionLoss(e);
+  }
+  return q;
+}
+
+/** 运行一段 SQL（单条或选中片段）。 */
+export async function runSqlText(text: string) {
+  const sqlText = text.trim();
+  if (!sqlText || state.query?.running) return;
+  if (state.info?.readOnly && !isReadOnlySql(sqlText)) {
+    pushMessage("error", state.t.readOnlyBlocked);
+    return;
+  }
+  state.lastFile = "";
+  await startQuery(sqlText);
+}
+
+/** 整篇编辑器内容。 */
+export async function runSql() {
+  await runSqlText(state.sql);
+}
+
+function waitDone(q: QueryState): Promise<void> {
+  return new Promise((resolve) => {
+    const iv = setInterval(() => {
+      if (q.done) {
+        clearInterval(iv);
+        resolve();
+      }
+    }, 50);
+  });
+}
+
+/** 多语句顺序执行：逐条启动，上一条完成后才发下一条；失败即停。
+ * 每条的结果/回执照常进结果区与消息面板，这里只追加进度摘要。 */
+export async function runStatements(sqls: string[]) {
+  if (state.query?.running) return;
+  for (let i = 0; i < sqls.length; i += 1) {
+    const text = sqls[i];
+    if (state.info?.readOnly && !isReadOnlySql(text)) {
+      pushMessage("error", `${state.t.stmtFailed(i + 1, sqls.length)}: ${state.t.readOnlyBlocked}`);
+      return;
+    }
+    state.lastFile = "";
+    const q = await startQuery(text);
+    if (!q.queryId) return; // 启动失败，错误已入消息面板
+    await waitDone(q);
+    if (q.error && !q.cancelled) {
+      pushMessage("error", state.t.stmtStopped(i + 1, sqls.length));
+      return;
+    }
+    const detail = q.receipt
+      ? `${q.receipt.command} · ${state.t.rowsAffected(String(q.receipt.rowsAffected))}`
+      : `${q.totalRows} ${state.lang === "zh" ? "行" : "rows"}`;
+    pushMessage("receipt", `▸ ${state.t.stmtDone(i + 1, sqls.length)} · ${detail}`);
   }
 }
 
@@ -382,6 +475,94 @@ async function fetchPage(q: QueryState, offset: number) {
 }
 
 // ---------------------------------------------------------------------------
+// 前端列排序 / 导出
+// ---------------------------------------------------------------------------
+
+/** 前端排序只对可全量拉取的结果集开放（更大的结果请用 SQL ORDER BY）。 */
+export const SORT_ROW_LIMIT = 20_000;
+
+function compareCells(a: CellValue, b: CellValue): number {
+  // null 恒排最后（与方向无关）；number 数值比，其余按字符串比
+  if (a === null || a === undefined) return 1;
+  if (b === null || b === undefined) return -1;
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  const sa = typeof a === "object" ? JSON.stringify(a) : String(a);
+  const sb = typeof b === "object" ? JSON.stringify(b) : String(b);
+  return sa < sb ? -1 : sa > sb ? 1 : 0;
+}
+
+/** 表头点击：asc → desc → off 循环。仅在结果已收完时可排序（快照才完整）。 */
+export async function toggleSort(col: number) {
+  const q = state.query;
+  if (!q || q.receipt || q.sortPreparing) return;
+  if (q.sort && q.sort.col === col && q.sort.dir === -1) {
+    q.sort = null;
+    q.sortView = null;
+    return;
+  }
+  if (!q.done) {
+    pushMessage("info", state.t.sortNeedsDone);
+    return;
+  }
+  if (q.totalRows > SORT_ROW_LIMIT) {
+    pushMessage("info", `${state.t.sortTooLarge}（${q.totalRows} > ${SORT_ROW_LIMIT}）`);
+    return;
+  }
+  const dir: 1 | -1 = q.sort?.col === col ? -1 : 1;
+  q.sortPreparing = true;
+  try {
+    // 全量拉页（已缓存的跳过；顺序 await 避免瞬时打满桥）
+    for (let off = 0; off < q.totalRows; off += PAGE_SIZE) {
+      if (!q.pages.has(off)) await fetchPage(q, off);
+    }
+    const all: CellValue[][] = [];
+    for (let off = 0; off < q.totalRows; off += PAGE_SIZE) {
+      const page = q.pages.get(off);
+      if (page) all.push(...page);
+    }
+    all.sort((r1, r2) => compareCells(r1[col] ?? null, r2[col] ?? null) * dir);
+    q.sort = { col, dir };
+    q.sortView = all;
+  } finally {
+    q.sortPreparing = false;
+  }
+}
+
+/** 退出排序快照（状态栏排序徽章的 ✕）。 */
+export function clearSort() {
+  const q = state.query;
+  if (!q) return;
+  q.sort = null;
+  q.sortView = null;
+}
+
+export interface ExportResult {
+  path: string;
+  rows: number;
+  bytes: number;
+  finished: boolean;
+}
+
+/** 导出结果到 `<DATA>/exports/`（sidecar 流式落盘）；路径进消息面板。 */
+export async function exportQuery(format: "csv" | "tsv"): Promise<ExportResult | null> {
+  const q = state.query;
+  if (!q?.queryId || q.receipt) return null;
+  const r = await invoke<ExportResult>("qsdb/query/export", {
+    connectionId: state.connectionId,
+    queryId: q.queryId,
+    format,
+  });
+  const size = humanBytes(r.bytes, state.lang);
+  const unit = state.lang === "zh" ? "行" : "rows";
+  pushMessage(
+    "receipt",
+    r.finished ? `${state.t.exportDone}: ${r.path} · ${r.rows} ${unit} · ${size}` : `${state.t.exportPartial}: ${r.path} · ${r.rows} ${unit}`,
+  );
+  state.lastFile = r.path;
+  return r;
+}
+
+// ---------------------------------------------------------------------------
 // 分区面板
 // ---------------------------------------------------------------------------
 
@@ -411,6 +592,85 @@ export function closePartitions() {
   state.partitionsTable = "";
   state.partitions = [];
   state.partitionsSize = null;
+}
+
+// ---------------------------------------------------------------------------
+// 服务器概览（侧栏"服务器"页）
+// ---------------------------------------------------------------------------
+
+export interface RunningQuery {
+  id: string;
+  sql: string;
+  elapsedMs: number;
+  memoryBytes: number;
+  cancelled: boolean;
+  sessionId: string | null;
+}
+
+export interface AdminSessionRow {
+  id: string;
+  user: string;
+  role: string | null;
+  client: string;
+  createdAtMs: number;
+  lastActiveMs: number;
+  idleMs: number;
+  defaultDb: string;
+  runningQueries: string[];
+  queriesTotal: number;
+  rowsWritten: number;
+}
+
+export interface StatsInfo {
+  tables: number;
+  storeBytes: number;
+  writeBuffer: { table: string; batches: number; bytes: number }[];
+}
+
+export interface ServerPanel {
+  loading: boolean;
+  queries: RunningQuery[];
+  sessions: AdminSessionRow[];
+  /** 会话是 admin 专属端点；非 admin 拿到 403 时给出提示而不是报错横幅 */
+  sessionsError: string;
+  stats: StatsInfo | null;
+  error: string;
+}
+
+export async function loadServerPanel() {
+  const p = state.server;
+  p.loading = true;
+  p.error = "";
+  p.sessionsError = "";
+  const conn = { connectionId: state.connectionId };
+  const [queries, stats, sessions] = await Promise.allSettled([
+    invoke<RunningQuery[]>("qsdb/queries/list", conn),
+    invoke<StatsInfo>("qsdb/server/stats", conn),
+    invoke<AdminSessionRow[]>("qsdb/sessions/list", conn),
+  ]);
+  p.queries = queries.status === "fulfilled" ? queries.value : p.queries;
+  p.stats = stats.status === "fulfilled" ? stats.value : p.stats;
+  if (sessions.status === "fulfilled") {
+    p.sessions = sessions.value;
+  } else {
+    p.sessions = [];
+    p.sessionsError = sessions.reason instanceof Error ? sessions.reason.message : String(sessions.reason);
+  }
+  if (queries.status === "rejected") p.error = messageOf(queries.reason);
+  if (stats.status === "rejected") p.error = p.error || messageOf(stats.reason);
+  p.loading = false;
+}
+
+export async function cancelServerQuery(queryId: string) {
+  await invoke("qsdb/queries/cancel", { connectionId: state.connectionId, queryId });
+  pushMessage("info", `${state.t.cancelled}: ${queryId}`);
+  await loadServerPanel();
+}
+
+export async function kickSession(sessionId: string) {
+  await invoke("qsdb/sessions/kick", { connectionId: state.connectionId, sessionId });
+  pushMessage("info", `${state.t.sessionKicked}: ${sessionId}`);
+  await loadServerPanel();
 }
 
 export { state, readonly };

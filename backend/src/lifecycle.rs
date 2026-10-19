@@ -49,6 +49,26 @@ fn auth_for(p: &LifecycleParams) -> Auth {
     }
 }
 
+/// 匿名可用的强校验：`/health` 是免鉴权的（只证"可达"），配了凭证的
+/// 服务端照样放行 health、拒绝一切数据接口——所以匿名必须再探一个
+/// **受保护接口**（`/databases`），401 就是"服务端要求认证"，显式报给
+/// 用户，而不是"测试成功但什么都没有"。成功时返回库清单供调用方复用。
+fn verify_anonymous(client: &Client) -> Result<Vec<qsdb_client::DbInfo>, PluginError> {
+    match client.databases() {
+        Ok(dbs) => Ok(dbs),
+        Err(e @ qsdb_client::Error::Api { status: 401, .. }) => {
+            let _ = e;
+            Err(error::qsdb_error(
+                "AUTH_REQUIRED",
+                Some(401),
+                false,
+                "this QSDB server requires authentication; configure Basic or Bearer auth instead of anonymous",
+            ))
+        }
+        Err(e) => Err(error::from_qsdb(&e)),
+    }
+}
+
 /// `connection/test`：临时 client 上做 health + 认证校验 + 默认库验证。
 pub fn test(_registry: &Registry, params: &Value) -> Result<Value, PluginError> {
     let p = parse(params)?;
@@ -67,16 +87,9 @@ pub fn test(_registry: &Registry, params: &Value) -> Result<Value, PluginError> 
     // 2. 认证校验
     let (user, role, default_db) = match p.auth {
         AuthKind::None => {
-            // 匿名：health 即可。给了库名时验证可见性（401 会说明服务端要求登录）。
+            // 匿名：health 只证可达，还必须过受保护接口（见 verify_anonymous）。
+            let dbs = verify_anonymous(&client)?;
             if let Some(db) = &p.database {
-                let dbs = client.databases().map_err(|e| {
-                    error::qsdb_error(
-                        "AUTH_REQUIRED",
-                        None,
-                        false,
-                        format!("anonymous access cannot verify database '{db}': {e}"),
-                    )
-                })?;
                 if !dbs.iter().any(|d| &d.name == db) {
                     return Err(error::qsdb_error(
                         "DATABASE_NOT_FOUND",
@@ -173,8 +186,9 @@ pub fn connect(registry: &Registry, params: &Value) -> Result<Value, PluginError
                     format!("cannot reach QSDB at {}:{}: {}", p.runtime_host, p.runtime_port, e),
                 )
             })?;
+            // 与 test 同款强校验：health 免鉴权不代表匿名可用。
+            let dbs = verify_anonymous(&probe)?;
             if let Some(db) = &p.database {
-                let dbs = probe.databases().map_err(|e| from_auth_error(e, "anonymous access rejected"))?;
                 if !dbs.iter().any(|d| &d.name == db) {
                     return Err(error::qsdb_error(
                         "DATABASE_NOT_FOUND",

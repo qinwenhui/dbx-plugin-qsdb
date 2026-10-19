@@ -14,6 +14,7 @@
 //! 2. 每连接两个 `qsdb_client::Client`——流式查询独占 query client 期间，
 //!    control client 仍然可做 metadata/cancel/health。
 
+mod admin;
 mod error;
 mod lifecycle;
 mod metadata;
@@ -70,6 +71,14 @@ impl PluginHandler for QsdbPlugin {
             "qsdb/query/page" => query::page(&self.registry, &params),
             "qsdb/query/stop" => query::stop(&self.registry, &params),
             "qsdb/query/close" => query::close(&self.registry, &params),
+            "qsdb/query/export" => query::export(&self.registry, &params),
+            "qsdb/script/save" => spool::save_script(&params),
+            // ---- 服务器运维（运行查询/会话/统计） ----
+            "qsdb/server/stats" => admin::stats(&self.registry, &params),
+            "qsdb/queries/list" => admin::queries_list(&self.registry, &params),
+            "qsdb/queries/cancel" => admin::queries_cancel(&self.registry, &params),
+            "qsdb/sessions/list" => admin::sessions_list(&self.registry, &params),
+            "qsdb/sessions/kick" => admin::sessions_kick(&self.registry, &params),
             _ => Err(PluginError::method_not_found(method)),
         }
     }

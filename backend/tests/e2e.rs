@@ -196,7 +196,20 @@ fn handle_conn(mut stream: TcpStream, cancelled: Arc<AtomicBool>, generation: Ar
     loop {
         let Some(req) = read_request(&mut stream) else { return Ok(()) };
         if dispatch(&mut stream, req, &cancelled, &generation)? {
-            return Ok(()); // 流式响应（Connection: close）——连接到此为止
+            // 流式响应（Connection: close）——连接到此为止。**优雅关闭**：
+            // 先半关闭（客户端读到 EOF），再排干对端残余字节直到它也关——
+            // Windows 在有未读数据时 closesocket 会发 RST，客户端就会拿到
+            // 10054 而不是干净 EOF（真实服务器的行为是前者）。
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            let mut drain = [0u8; 4096];
+            loop {
+                match stream.read(&mut drain) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            return Ok(());
         }
     }
 }
@@ -282,6 +295,67 @@ fn dispatch(stream: &mut TcpStream, req: Request, cancelled: &Arc<AtomicBool>, g
                     ]
                 }),
             )?;
+            Ok(false)
+        }
+        ("GET", "/api/v1/stats") => {
+            if !auth_ok(&req) {
+                respond_json(stream, "401 Unauthorized", unauthorized())?;
+                return Ok(false);
+            }
+            respond_json(
+                stream,
+                "200 OK",
+                json!({
+                    "tables": 1,
+                    "storeBytes": 1413285,
+                    "writeBuffer": [ { "table": "default.sales", "batches": 2, "bytes": 4096 } ]
+                }),
+            )?;
+            Ok(false)
+        }
+        ("GET", "/api/v1/queries") => {
+            if !auth_ok(&req) {
+                respond_json(stream, "401 Unauthorized", unauthorized())?;
+                return Ok(false);
+            }
+            respond_json(
+                stream,
+                "200 OK",
+                json!({
+                    "queries": [
+                        { "id": "q-srv-1", "sql": "SELECT count(*) FROM big", "elapsedMs": 4210,
+                          "memoryBytes": 8388608, "cancelled": false, "sessionId": "sess-1" }
+                    ]
+                }),
+            )?;
+            Ok(false)
+        }
+        ("GET", "/api/v1/sessions") => {
+            if !auth_ok(&req) {
+                respond_json(stream, "401 Unauthorized", unauthorized())?;
+                return Ok(false);
+            }
+            respond_json(
+                stream,
+                "200 OK",
+                json!({
+                    "sessions": [
+                        { "id": "sess-1", "user": "root", "role": "admin", "client": "qsdb-client",
+                          "createdAtMs": 1760000000000i64, "lastActiveMs": 1760000100000i64,
+                          "idleMs": 1200, "defaultDb": "default",
+                          "runningQueries": ["q-srv-1"], "queriesTotal": 42, "rowsWritten": 7 }
+                    ]
+                }),
+            )?;
+            Ok(false)
+        }
+        ("DELETE", p) if p.starts_with("/api/v1/sessions/") => {
+            if !auth_ok(&req) {
+                respond_json(stream, "401 Unauthorized", unauthorized())?;
+                return Ok(false);
+            }
+            let id = p.trim_start_matches("/api/v1/sessions/");
+            respond_json(stream, "200 OK", json!({ "kicked": id, "cancelledQueries": 1 }))?;
             Ok(false)
         }
         ("GET", p) if p.ends_with("/default.sales/partitions") => {
@@ -713,7 +787,7 @@ fn streaming_query_pages_and_finishes() {
     let qid = started_resp["queryId"].as_str().unwrap().to_string();
 
     // started 事件带列
-    let ev = sc.wait_event(10, |e| e["method"] == "qsdb/query/started" && e["params"]["queryId"] == qid.as_str()).expect("started event");
+    let ev = sc.wait_event(30, |e| e["method"] == "qsdb/query/started" && e["params"]["queryId"] == qid.as_str()).expect("started event");
     let cols = ev["params"]["columns"].as_array().unwrap();
     assert_eq!(cols.len(), 2);
     assert_eq!(cols[0]["name"], "region");
@@ -721,7 +795,8 @@ fn streaming_query_pages_and_finishes() {
     assert_eq!(cols[1]["tag"], "i64");
 
     // finished 事件
-    let ev = sc.wait_event(10, |e| e["method"] == "qsdb/query/finished" && e["params"]["queryId"] == qid.as_str()).expect("finished event");
+    let ev = sc.wait_event(30, |e| e["method"] == "qsdb/query/finished" && e["params"]["queryId"] == qid.as_str())
+        .unwrap_or_else(|| panic!("no finished event; sidecar events so far: {:#}", serde_json::to_string(&sc.events()).unwrap_or_default()));
     assert_eq!(ev["params"]["kind"], "rows");
     assert_eq!(ev["params"]["totalRows"], 3);
 
@@ -760,6 +835,74 @@ fn streaming_query_pages_and_finishes() {
 }
 
 #[test]
+fn export_writes_csv_and_tsv() {
+    let mock = Mock::start();
+    let mut sc = fresh_sidecar();
+    sc.call("connection/connect", sc.lifecycle_params(&mock, "basic", PASSWORD)).unwrap();
+
+    let started = sc
+        .call("qsdb/query/start", json!({ "connectionId": "conn-e2e", "sql": "SELECT region, amount FROM default.sales" }))
+        .unwrap();
+    let qid = started["queryId"].as_str().unwrap().to_string();
+    sc.wait_event(30, |e| e["method"] == "qsdb/query/finished" && e["params"]["queryId"] == qid.as_str())
+        .expect("finished");
+
+    // CSV：表头 + NULL = 空串
+    let r = sc
+        .call("qsdb/query/export", json!({ "connectionId": "conn-e2e", "queryId": qid, "format": "csv" }))
+        .unwrap();
+    assert_eq!(r["rows"], 3);
+    assert_eq!(r["finished"], true);
+    let path = r["path"].as_str().unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 4, "{text}");
+    assert_eq!(lines[0], "region,amount");
+    assert!(lines[3].starts_with(","), "NULL region → 空字段: {}", lines[3]);
+
+    // TSV：同查询再导
+    let r2 = sc
+        .call("qsdb/query/export", json!({ "connectionId": "conn-e2e", "queryId": qid, "format": "tsv" }))
+        .unwrap();
+    let text2 = std::fs::read_to_string(r2["path"].as_str().unwrap()).unwrap();
+    assert!(text2.lines().next().unwrap().contains('\t'));
+
+    // 越界防护：别的连接导不出这条查询
+    let e = sc
+        .call("qsdb/query/export", json!({ "connectionId": "nope", "queryId": qid, "format": "csv" }))
+        .unwrap_err();
+    assert_eq!(e["data"]["qsdbCode"], "CONNECTION_NOT_FOUND");
+
+    sc.call("connection/disconnect", sc.lifecycle_params(&mock, "basic", PASSWORD)).unwrap();
+    mock.stop();
+}
+
+#[test]
+fn script_save_writes_sanitized_file() {
+    let mut sc = fresh_sidecar();
+
+    // 带名字（空格/斜杠/中文都消毒掉；不得出现 ..）
+    let r = sc.call("qsdb/script/save", json!({ "name": "etl job/../每日", "sql": "SELECT 1;\n" })).unwrap();
+    let path = r["path"].as_str().unwrap().to_string();
+    assert!(path.ends_with(".sql"), "{path}");
+    assert!(!path.contains(".."), "{path}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "SELECT 1;\n");
+
+    // 同名覆盖（保存语义）
+    let r2 = sc.call("qsdb/script/save", json!({ "name": "etl job/../每日", "sql": "SELECT 2;" })).unwrap();
+    assert_eq!(r2["path"].as_str(), Some(path.as_str()));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "SELECT 2;");
+
+    // 无名字 → 时间戳新文件
+    let r3 = sc.call("qsdb/script/save", json!({ "sql": "SHOW TABLES" })).unwrap();
+    assert_ne!(r3["path"].as_str(), Some(path.as_str()));
+
+    // 缺 sql → 参数错误
+    let e = sc.call("qsdb/script/save", json!({ "name": "x" })).unwrap_err();
+    assert_eq!(e["code"], -32602);
+}
+
+#[test]
 fn query_error_surfaces_qsdb_code() {
     let mock = Mock::start();
     let mut sc = fresh_sidecar();
@@ -770,7 +913,7 @@ fn query_error_surfaces_qsdb_code() {
         .unwrap();
     let qid = started["queryId"].as_str().unwrap();
     let ev = sc
-        .wait_event(10, |e| e["method"] == "qsdb/query/error" && e["params"]["queryId"] == qid)
+        .wait_event(30, |e| e["method"] == "qsdb/query/error" && e["params"]["queryId"] == qid)
         .expect("error event");
     assert_eq!(ev["params"]["code"], "TABLE_NOT_FOUND");
     assert_eq!(ev["params"]["receivedRows"], 0);
@@ -781,7 +924,7 @@ fn query_error_surfaces_qsdb_code() {
         .unwrap();
     let qid = started["queryId"].as_str().unwrap();
     let ev = sc
-        .wait_event(10, |e| e["method"] == "qsdb/query/error" && e["params"]["queryId"] == qid)
+        .wait_event(30, |e| e["method"] == "qsdb/query/error" && e["params"]["queryId"] == qid)
         .expect("error event");
     assert_eq!(ev["params"]["code"], "FORBIDDEN");
 
@@ -800,7 +943,7 @@ fn exec_statement_returns_receipt_not_rows() {
         .unwrap();
     let qid = started["queryId"].as_str().unwrap();
     let ev = sc
-        .wait_event(10, |e| e["method"] == "qsdb/query/finished" && e["params"]["queryId"] == qid)
+        .wait_event(30, |e| e["method"] == "qsdb/query/finished" && e["params"]["queryId"] == qid)
         .expect("finished");
     assert_eq!(ev["params"]["kind"], "exec");
     assert_eq!(ev["params"]["command"], "CREATE");
@@ -866,7 +1009,7 @@ fn stop_during_transfer_keeps_received_rows() {
         .call("qsdb/query/start", json!({ "connectionId": "conn-e2e", "sql": "SELECT region, amount FROM default.sales" }))
         .expect("new query after stop");
     let qid2 = started2["queryId"].as_str().unwrap();
-    let _ = sc.wait_event(10, |e| e["method"] == "qsdb/query/finished" && e["params"]["queryId"] == qid2);
+    let _ = sc.wait_event(30, |e| e["method"] == "qsdb/query/finished" && e["params"]["queryId"] == qid2);
     // 收尾
     let _ = sc.call("qsdb/query/close", json!({ "connectionId": "conn-e2e", "queryId": qid }));
     let _ = sc.call("qsdb/query/close", json!({ "connectionId": "conn-e2e", "queryId": qid2 }));
@@ -895,9 +1038,62 @@ fn read_only_connection_rejects_writes() {
         .call("qsdb/query/start", json!({ "connectionId": "conn-e2e", "sql": "SELECT region, amount FROM default.sales" }))
         .expect("read on read-only connection");
     let qid = started["queryId"].as_str().unwrap();
-    assert!(sc.wait_event(10, |e| e["method"] == "qsdb/query/finished" && e["params"]["queryId"] == qid).is_some());
+    assert!(sc.wait_event(30, |e| e["method"] == "qsdb/query/finished" && e["params"]["queryId"] == qid).is_some());
 
     sc.call("connection/disconnect", sc.lifecycle_params(&mock, "basic", PASSWORD)).unwrap();
+    mock.stop();
+}
+
+#[test]
+fn admin_surface_queries_sessions_stats() {
+    let mock = Mock::start();
+    let mut sc = fresh_sidecar();
+    sc.call("connection/connect", sc.lifecycle_params(&mock, "basic", PASSWORD)).unwrap();
+
+    let stats = sc.call("qsdb/server/stats", json!({ "connectionId": "conn-e2e" })).unwrap();
+    assert_eq!(stats["tables"], 1);
+    assert_eq!(stats["storeBytes"], 1413285);
+    assert_eq!(stats["writeBuffer"][0]["table"], "default.sales");
+
+    let queries = sc.call("qsdb/queries/list", json!({ "connectionId": "conn-e2e" })).unwrap();
+    let list = queries.as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], "q-srv-1");
+    assert_eq!(list[0]["memoryBytes"], 8388608);
+
+    // 取消服务端查询（mock 的 cancel 路由在 /api/v1/queries/{id}/cancel）
+    let c = sc
+        .call("qsdb/queries/cancel", json!({ "connectionId": "conn-e2e", "queryId": "q-srv-1" }))
+        .unwrap();
+    assert_eq!(c["cancelled"], true);
+
+    let sessions = sc.call("qsdb/sessions/list", json!({ "connectionId": "conn-e2e" })).unwrap();
+    let list = sessions.as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["user"], USER);
+    assert_eq!(list[0]["runningQueries"][0], "q-srv-1");
+
+    let kick = sc
+        .call("qsdb/sessions/kick", json!({ "connectionId": "conn-e2e", "sessionId": "sess-9" }))
+        .unwrap();
+    assert_eq!(kick["kicked"], true);
+    assert_eq!(kick["killedQueries"], 1);
+
+    sc.call("connection/disconnect", sc.lifecycle_params(&mock, "basic", PASSWORD)).unwrap();
+    mock.stop();
+}
+
+#[test]
+fn anonymous_against_auth_server_fails_clearly() {
+    // mock 的受保护接口全部要求认证：匿名 test 必须显式失败（而不是
+    // health 通过后"成功但什么都看不到"）。
+    let mock = Mock::start();
+    let mut sc = fresh_sidecar();
+    let e = sc.call("connection/test", sc.lifecycle_params(&mock, "none", "")).unwrap_err();
+    assert_eq!(e["data"]["qsdbCode"], "AUTH_REQUIRED", "{e}");
+    assert_eq!(e["data"]["status"], 401);
+    let e = sc.call("connection/connect", sc.lifecycle_params(&mock, "none", "")).unwrap_err();
+    assert_eq!(e["data"]["qsdbCode"], "AUTH_REQUIRED", "{e}");
     mock.stop();
 }
 

@@ -1,4 +1,4 @@
-//! 查询：`qsdb/query/start|page|stop|close` + `qsdb/query/*` 事件。
+//! 查询：`qsdb/query/start|page|stop|close|export` + `qsdb/query/*` 事件。
 //!
 //! 模型：
 //! - **读查询**：`query/start` 立即返回 queryId；专用线程 `query_stream`
@@ -172,6 +172,63 @@ pub fn stop(registry: &Registry, params: &Value) -> Result<Value, PluginError> {
         crate::log_cancel_ignored(&state.query_id, &e);
     }
     Ok(json!({ "stopped": true, "receivedRows": state.received_rows() }))
+}
+
+/// `qsdb/query/export`：把 spool（已接收的行）流式写成 CSV/TSV 文件，
+/// 落在 `<DATA>/exports/`（sidecar 重启不清）。查询未结束时也可导出，
+/// 返回 `finished: false` 让 UI 提示"部分导出"。
+pub fn export(registry: &Registry, params: &Value) -> Result<Value, PluginError> {
+    let (state, _, _) = query_params(registry, params)?;
+    if state.kind != StatementKind::Read {
+        return Err(error::qsdb_error("NO_CURSOR", None, false, "executed statements have no rows to export"));
+    }
+    let (delim, ext) = match params.get("format").and_then(Value::as_str) {
+        Some("tsv") => (b'\t', "tsv"),
+        _ => (b',', "csv"),
+    };
+    let include_header = params.get("includeHeader").and_then(Value::as_bool).unwrap_or(true);
+
+    let export_dir = spool::exports_dir();
+    std::fs::create_dir_all(&export_dir)
+        .map_err(|e| error::qsdb_error("EXPORT_WRITE_ERROR", None, false, format!("cannot create exports dir: {e}")))?;
+    // 文件名：qsdb-<查询 id>-<unix 秒>.<ext>（query id 是我们生成的，安全）
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = export_dir.join(format!("qsdb-{}-{ts}.{ext}", state.query_id));
+
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).map_err(|e| {
+        error::qsdb_error("EXPORT_WRITE_ERROR", None, false, format!("cannot create export file: {e}"))
+    })?);
+
+    let rows;
+    if include_header {
+        if let Ok(cols) = spool::read_columns(&state.dir) {
+            let names: Vec<String> = cols
+                .iter()
+                .filter_map(|c| c.get("name").and_then(Value::as_str).map(|s| spool::delim_field(s, delim)))
+                .collect();
+            if !names.is_empty() {
+                let mut header = names.join(&char::from(delim).to_string());
+                header.push('\n');
+                std::io::Write::write_all(&mut file, header.as_bytes())
+                    .map_err(|e| error::qsdb_error("EXPORT_WRITE_ERROR", None, false, format!("export write failed: {e}")))?;
+            }
+        }
+    }
+    rows = spool::stream_delimited(&state, &mut file, delim)
+        .map_err(|e| error::qsdb_error("EXPORT_WRITE_ERROR", None, false, format!("export failed: {e}")))?;
+    let bytes = std::io::Write::flush(&mut file)
+        .and_then(|_| std::io::Seek::stream_position(&mut file))
+        .map_err(|e| error::qsdb_error("EXPORT_WRITE_ERROR", None, false, format!("export flush failed: {e}")))?;
+
+    Ok(json!({
+        "path": path.to_string_lossy(),
+        "rows": rows,
+        "bytes": bytes,
+        "finished": state.finished.load(Ordering::SeqCst),
+    }))
 }
 
 /// `qsdb/query/close`：删除 spool、移除 cursor。disconnect 时自动清理全部。

@@ -21,6 +21,6 @@ checksums.json
 .DS_Store
 Thumbs.db
 *.log
-# TypeScript incremental build info
-tsconfig.tsbuildinfo
-*.tsbuildinfo
+# 锁文件不入库：dbx-plugin CLI 打包时会注入自带 SDK 的 [patch]（--config），
+# 与本地 vendor path 依赖的锁形态不一致，留给各自构建现场解析。
+backend/Cargo.lock

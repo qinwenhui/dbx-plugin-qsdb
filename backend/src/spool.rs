@@ -30,6 +30,42 @@ pub fn data_root() -> PathBuf {
         .join("queries")
 }
 
+/// 插件数据根（exports 的父目录）。queries/ 随启动清理，exports/ 持久保留
+/// ——用户导出的文件不能被 sidecar 重启抹掉。
+pub fn plugin_data_root() -> PathBuf {
+    std::env::var_os("DBX_PLUGIN_DATA_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+}
+
+/// 导出文件目录：`<DATA>/exports/`。
+pub fn exports_dir() -> PathBuf {
+    plugin_data_root().join("exports")
+}
+
+/// `qsdb/script/save`：编辑器脚本落盘 `<DATA>/scripts/<name>.sql`。
+/// 带显式 name 覆盖同名文件（保存语义）；不带则时间戳新文件。
+/// name 经路径段消毒——用户输入的任何东西都当不可信文件名对待。
+pub fn save_script(params: &Value) -> Result<Value, PluginError> {
+    let sql_text = params
+        .get("sql")
+        .and_then(Value::as_str)
+        .ok_or_else(|| crate::error::invalid_param("missing sql"))?;
+    let dir = plugin_data_root().join("scripts");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| crate::error::qsdb_error("SCRIPT_WRITE_ERROR", None, false, format!("cannot create scripts dir: {e}")))?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let base = match params.get("name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+        Some(n) => sanitize_segment(n),
+        None => format!("script-{ts}"),
+    };
+    let path = dir.join(format!("{base}.sql"));
+    std::fs::write(&path, sql_text)
+        .map_err(|e| crate::error::qsdb_error("SCRIPT_WRITE_ERROR", None, false, format!("cannot write script: {e}")))?;
+    Ok(serde_json::json!({ "path": path.to_string_lossy(), "bytes": sql_text.len() }))
+}
+
 /// 连接级 spool 目录。
 pub fn connection_dir(connection_id: &str) -> PathBuf {
     data_root().join(sanitize_segment(connection_id))
@@ -37,7 +73,7 @@ pub fn connection_dir(connection_id: &str) -> PathBuf {
 
 /// 路径段消毒：id 是我们生成/宿主给的字符串，但目录名防御到底——
 /// 只留 `A-Za-z0-9._-`，其余替换 `_`；连续点折叠成 `_`（防 `..` 穿越）。
-fn sanitize_segment(s: &str) -> String {
+pub fn sanitize_segment(s: &str) -> String {
     let cleaned: String = s
         .chars()
         .take(128)
@@ -171,6 +207,60 @@ fn row_file(state: &QueryState) -> PathBuf {
     state.dir.join("rows.jsonl")
 }
 
+/// 读 started 时的列描述（导出表头用）。
+pub fn read_columns(dir: &Path) -> std::io::Result<Vec<Value>> {
+    let bytes = fs::read(dir.join("columns.json"))?;
+    serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+}
+
+// ---------------------------------------------------------------------------
+// CSV / TSV 导出
+// ---------------------------------------------------------------------------
+
+/// 单元格 → 文本（NULL = 空串；复合值按 JSON 文本）。
+fn cell_to_string(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// RFC4180 转义：含分隔符/引号/换行则加引号并翻倍内部引号。
+pub fn delim_field(s: &str, delim: u8) -> String {
+    let needs = s.bytes().any(|b| b == delim || b == b'"' || b == b'\n' || b == b'\r');
+    if needs {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// 流式把 rows.jsonl 逐行转成 CSV/TSV 写出。worker 仍在写时读到当前文件尾
+/// 为止（导出"已接收"的行；调用方用 finished 标记自行提示）。返回行数。
+pub fn stream_delimited(state: &QueryState, out: &mut impl Write, delim: u8) -> std::io::Result<u64> {
+    let reader = BufReader::new(File::open(row_file(state))?);
+    let mut count = 0u64;
+    for line in reader.split(b'\n') {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_slice(&line).map_err(std::io::Error::other)?;
+        let fields = match &value {
+            Value::Array(items) => items.iter().map(|v| delim_field(&cell_to_string(v), delim)).collect::<Vec<_>>(),
+            other => vec![delim_field(&cell_to_string(other), delim)],
+        };
+        let mut row = fields.join(&char::from(delim).to_string());
+        row.push('\n');
+        out.write_all(row.as_bytes())?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// 删除单个查询目录（幂等）。
 pub fn remove_query_dir(dir: &Path) {
     let _ = fs::remove_dir_all(dir);
@@ -297,5 +387,48 @@ mod tests {
         let d = connection_dir("../../evil");
         assert!(!d.to_string_lossy().contains(".."));
         assert_eq!(sanitize_segment(""), "_");
+    }
+
+    #[test]
+    fn delim_field_escapes_quotes_and_separators() {
+        assert_eq!(delim_field("plain", b','), "plain");
+        assert_eq!(delim_field("a,b", b','), "\"a,b\"");
+        assert_eq!(delim_field("a\tb", b','), "a\tb"); // CSV 不关心制表符
+        assert_eq!(delim_field("a\tb", b'\t'), "\"a\tb\"");
+        assert_eq!(delim_field("say \"hi\"", b','), "\"say \"\"hi\"\"\"");
+        assert_eq!(delim_field("line\nbreak", b','), "\"line\nbreak\"");
+    }
+
+    #[test]
+    fn stream_delimited_roundtrip() {
+        let (state, dir) = temp_state("export");
+        let mut writer = SpoolWriter::create(&dir).unwrap();
+        for row in [
+            serde_json::json!([1, "plain", null]),
+            serde_json::json!([2, "a,b", true]),
+            serde_json::json!(["x\"y", 1.5, false]),
+        ] {
+            let offset = writer.append_row(&row).unwrap();
+            state.cursor.lock().unwrap().offsets.push(offset);
+            state.cursor.lock().unwrap().total_rows += 1;
+        }
+        writer.flush().unwrap();
+
+        let mut out: Vec<u8> = Vec::new();
+        let n = stream_delimited(&state, &mut out, b',').unwrap();
+        assert_eq!(n, 3);
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "1,plain,");
+        assert_eq!(lines[1], "2,\"a,b\",true");
+        assert_eq!(lines[2], "\"x\"\"y\",1.5,false");
+
+        // TSV 分隔符
+        let mut out: Vec<u8> = Vec::new();
+        stream_delimited(&state, &mut out, b'\t').unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().nth(1).unwrap(), "2\ta,b\ttrue");
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

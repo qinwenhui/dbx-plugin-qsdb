@@ -10,8 +10,8 @@
   "source": "https://github.com/qinwenhui/dbx-plugin-qsdb",
   "homepage": "https://github.com/qinwenhui/dbx-plugin-qsdb",
   "engines": {
-    "dbx": ">=0.6.0",
-    "host_api": "^1.1"
+    "dbx": ">=0.5.68",
+    "host_api": "^1.0"
   },
   "permissions": [
     "host.workbench",
