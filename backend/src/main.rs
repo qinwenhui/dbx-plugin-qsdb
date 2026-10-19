@@ -15,6 +15,7 @@
 //!    control client 仍然可做 metadata/cancel/health。
 
 mod admin;
+mod context_menu;
 mod error;
 mod lifecycle;
 mod metadata;
@@ -79,6 +80,9 @@ impl PluginHandler for QsdbPlugin {
             "qsdb/queries/cancel" => admin::queries_cancel(&self.registry, &params),
             "qsdb/sessions/list" => admin::sessions_list(&self.registry, &params),
             "qsdb/sessions/kick" => admin::sessions_kick(&self.registry, &params),
+            // ---- 连接右键菜单（宿主在菜单打开时实时拉取，500ms 超时） ----
+            m if m.starts_with("contextMenu/resolve/") => context_menu::resolve(&self.registry, &params),
+            m if m.starts_with("contextMenu/") => context_menu::action(&self.registry, &params),
             _ => Err(PluginError::method_not_found(method)),
         }
     }

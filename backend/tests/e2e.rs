@@ -903,6 +903,59 @@ fn script_save_writes_sanitized_file() {
 }
 
 #[test]
+fn context_menu_resolve_reflects_session() {
+    let mock = Mock::start();
+    let mut sc = fresh_sidecar();
+    sc.call("connection/connect", sc.lifecycle_params(&mock, "basic", PASSWORD)).unwrap();
+
+    // 已连接：身份行 + 计数 + 工作台入口
+    let r = sc
+        .call(
+            "contextMenu/resolve/cn.qinwh.qsdb.connection-menu",
+            json!({
+                "connection": { "id": "conn-e2e", "dbType": "plugin", "name": "QSDB", "database": "default" },
+                "locale": "zh-CN"
+            }),
+        )
+        .unwrap();
+    let items = r["items"].as_array().unwrap();
+    assert_eq!(items[0]["enabled"], false, "身份行是禁用的信息项");
+    let identity = items[0]["label"].as_str().unwrap();
+    assert!(identity.contains(USER), "{identity}");
+    assert!(identity.contains("0.1.0-mock"), "{identity}");
+    assert!(identity.contains("admin"), "{identity}");
+    // 动作项都指向我们的工作台
+    for item in items.iter().skip(1) {
+        assert_eq!(item["action"]["type"], "open-workbench");
+        assert_eq!(item["action"]["workbench"], "cn.qinwh.qsdb.main");
+    }
+
+    // 未知连接：回退为单一工作台入口，不报错
+    let r2 = sc
+        .call(
+            "contextMenu/resolve/cn.qinwh.qsdb.connection-menu",
+            json!({ "connection": { "id": "ghost", "dbType": "plugin", "name": "x" }, "locale": "en" }),
+        )
+        .unwrap();
+    let items2 = r2["items"].as_array().unwrap();
+    assert_eq!(items2.len(), 1);
+    assert_eq!(items2[0]["action"]["workbench"], "cn.qinwh.qsdb.main");
+
+    // 缺 connection 参数：空菜单，不报错
+    let r3 = sc.call("contextMenu/resolve/cn.qinwh.qsdb.connection-menu", json!({})).unwrap();
+    assert_eq!(r3["items"].as_array().unwrap().len(), 0);
+
+    // 静态 invoke 处理器不落 method_not_found
+    let r4 = sc
+        .call("contextMenu/cn.qinwh.qsdb.connection-menu", json!({ "connection": { "id": "conn-e2e" } }))
+        .unwrap();
+    assert!(r4.get("message").is_some());
+
+    sc.call("connection/disconnect", sc.lifecycle_params(&mock, "basic", PASSWORD)).unwrap();
+    mock.stop();
+}
+
+#[test]
 fn query_error_surfaces_qsdb_code() {
     let mock = Mock::start();
     let mut sc = fresh_sidecar();

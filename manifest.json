@@ -124,6 +124,13 @@
       "id": "cn.qinwh.qsdb.main",
       "label": "QSDB",
       "icon": "assets/plugin.svg"
+    },
+    {
+      "type": "context-menu",
+      "id": "cn.qinwh.qsdb.connection-menu",
+      "label": "QSDB",
+      "menu": "connection",
+      "dynamic": true
     }
   ],
   "localizations": {
@@ -147,7 +154,8 @@
             "connect_timeout_secs": { "label": "连接超时（秒）" }
           }
         },
-        "cn.qinwh.qsdb.main": { "label": "QSDB" }
+        "cn.qinwh.qsdb.main": { "label": "QSDB" },
+        "cn.qinwh.qsdb.connection-menu": { "label": "QSDB" }
       }
     }
   }
