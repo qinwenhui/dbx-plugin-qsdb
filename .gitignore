@@ -14,6 +14,8 @@ backend/target/
 *.dbxp
 *.artifact.json
 checksums.json
+# 官方约定：.dbxp 候选包只进 GitHub Release，不进 Git 历史
+dist/
 
 # IDE / OS
 .vscode/

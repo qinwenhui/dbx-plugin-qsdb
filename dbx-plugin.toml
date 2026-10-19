@@ -7,3 +7,10 @@ binary = "dbx-plugin-qsdb"
 
 [package]
 include = ["assets", "ui"]
+
+# 官方开发宿主（dbx-plugin dev）的前端构建命令；watch 模式由
+# frontend/watch-marker.mjs 包装 vite --watch，成功构建后输出
+# DBX_UI_BUILD_SUCCESS 才会触发热重载。
+[dev]
+ui_build = ["npm", "run", "build"]
+ui_watch = ["npm", "run", "build:watch"]

@@ -11,7 +11,7 @@
   "homepage": "https://github.com/qinwenhui/dbx-plugin-qsdb",
   "engines": {
     "dbx": ">=0.5.68",
-    "host_api": "^1.0"
+    "host_api": "1"
   },
   "permissions": [
     "host.workbench",

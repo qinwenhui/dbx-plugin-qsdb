@@ -427,6 +427,44 @@ body.col-resizing {
   text-align: right;
 }
 
+/* 确认对话框（自建——沙箱里原生 confirm 不可依赖） */
+.confirm-overlay {
+  z-index: 60;
+}
+.confirm-card {
+  width: min(360px, 90%);
+}
+.confirm-body {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 16px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.confirm-icon {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--color-primary-alpha, rgba(37, 99, 235, 0.12));
+  color: var(--color-primary, #2563eb);
+  font-size: 15px;
+}
+.confirm-icon.danger {
+  background: rgba(220, 38, 38, 0.12);
+  color: #dc2626;
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--color-border, #e4e4e7);
+}
+
 /* 状态栏：实体背景 + 置顶层级，网格内容永远压不到它 */
 .qsdb-statusbar {
   flex: none;

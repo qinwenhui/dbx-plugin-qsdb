@@ -1,0 +1,90 @@
+# 未签名候选包 Release 工作流（官方上架流程第一步）。
+# 打 tag（v*）触发：三平台构建 .dbxp + .artifact.json，聚合成
+# release-candidates.json 并发布 GitHub Release（draft，人工检查后发布）。
+# 注意：产物不进 Git 历史；发布资产不可覆盖（版本必须递增）。
+name: plugin-release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x64
+            rustflags: ""
+          - os: ubuntu-22.04
+            target: linux-x64
+            rustflags: ""
+          - os: macos-14
+            target: darwin-arm64
+            rustflags: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build UI
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build & package candidate
+        shell: pwsh
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          Remove-Item -ErrorAction SilentlyContinue backend/Cargo.lock
+          npm exec --yes @dbx-app/plugin-cli@0.1.9 -- package .
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-${{ matrix.target }}
+          path: |
+            dist/*.dbxp
+            dist/*.artifact.json
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate release-candidates.json
+        run: node scripts/build-release-candidates.mjs "${GITHUB_REF_NAME#v}" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME" dist > dist/release-candidates.json
+        shell: bash
+
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist/*.dbxp
+            dist/*.artifact.json
+            dist/release-candidates.json

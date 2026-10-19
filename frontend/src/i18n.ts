@@ -121,6 +121,8 @@ const messages = {
     anonymous: "anonymous",
     emptyEditorHint: "Write SQL in the editor and press Ctrl/Cmd+Enter to run",
     density: "Toggle grid density",
+    cancel: "Cancel",
+    confirm: "Confirm",
   },
   zh: {
     appName: "QSDB",
@@ -240,6 +242,8 @@ const messages = {
     anonymous: "匿名",
     emptyEditorHint: "在编辑器编写 SQL，按 Ctrl/Cmd+Enter 运行",
     density: "切换结果网格密度",
+    cancel: "取消",
+    confirm: "确认",
   },
 }
 

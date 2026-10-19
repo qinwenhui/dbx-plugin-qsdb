@@ -112,11 +112,27 @@ export function onQueryEvent(listener: (method: string, params: Record<string, u
   });
 }
 
-/** 订阅宿主环境变化（theme/locale 推送也走事件通道）。 */
+/** 订阅宿主环境变化（theme/locale）。官方通道是 window 的 `dbx-plugin-env`
+ * 事件；部分宿主/开发垫片也会经 onEvent 推 type:"env" 消息——两边都挂，
+ * 去重交给调用方（同值幂等）。 */
 export function onEnvChange(listener: (env: { locale?: string; theme?: DbxTheme }) => void): () => void {
-  return api().onEvent((message) => {
-    if (message.type === "env") {
-      listener({ locale: message.locale, theme: message.theme });
-    }
-  });
+  const offs: (() => void)[] = [];
+  try {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { locale?: string; theme?: DbxTheme } | undefined;
+      listener({ locale: detail?.locale, theme: detail?.theme });
+    };
+    window.addEventListener("dbx-plugin-env", handler);
+    offs.push(() => window.removeEventListener("dbx-plugin-env", handler));
+  } catch {
+    /* window 事件不可用时仅走事件通道 */
+  }
+  offs.push(
+    api().onEvent((message) => {
+      if (message.type === "env") {
+        listener({ locale: message.locale, theme: message.theme });
+      }
+    }),
+  );
+  return () => offs.forEach((off) => off());
 }

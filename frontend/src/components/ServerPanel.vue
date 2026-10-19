@@ -1,17 +1,20 @@
 <script setup lang="ts">
 // 服务器概览：身份、存储统计、运行中的查询（可取消）、会话（admin 可踢）。
-import { computed, onMounted } from "vue";
+// 破坏性操作（取消/踢）用自建 ConfirmDialog——沙箱里原生 confirm 不可依赖。
+import { computed, onMounted, ref } from "vue";
 import {
   state,
   loadServerPanel,
   cancelServerQuery,
   kickSession,
-  type RunningQuery,
-  type AdminSessionRow,
 } from "../store";
 import { humanBytes } from "../i18n";
+import ConfirmDialog from "./ConfirmDialog.vue";
 
 const t = computed(() => state.t);
+
+const pending = ref<{ kind: "cancel" | "kick"; id: string } | null>(null);
+const busy = ref(false);
 
 onMounted(() => {
   void loadServerPanel();
@@ -33,21 +36,18 @@ function fmtIdle(ms: number): string {
   return `${Math.floor(s / 3600)}h`;
 }
 
-async function cancel(q: RunningQuery) {
-  if (!window.confirm(t.value.confirmCancelQuery)) return;
+async function confirmPending() {
+  const p = pending.value;
+  if (!p || busy.value) return;
+  busy.value = true;
   try {
-    await cancelServerQuery(q.id);
+    if (p.kind === "cancel") await cancelServerQuery(p.id);
+    else await kickSession(p.id);
   } catch {
     /* 错误已入消息面板 */
-  }
-}
-
-async function kick(s: AdminSessionRow) {
-  if (!window.confirm(t.value.confirmKick)) return;
-  try {
-    await kickSession(s.id);
-  } catch {
-    /* 错误已入消息面板 */
+  } finally {
+    busy.value = false;
+    pending.value = null;
   }
 }
 </script>
@@ -104,7 +104,7 @@ async function kick(s: AdminSessionRow) {
           <span class="badge" style="height: 16px">{{ fmtMs(q.elapsedMs) }}</span>
           <span class="muted small">{{ t.memory }} {{ humanBytes(q.memoryBytes, state.lang) }}</span>
           <span class="spacer" style="flex: 1" />
-          <button class="dbx-btn dbx-btn--danger" style="height: 20px; font-size: 11px" @click="cancel(q)">
+          <button class="dbx-btn dbx-btn--danger" style="height: 20px; font-size: 11px" @click="pending = { kind: 'cancel', id: q.id }">
             {{ t.cancelQuery }}
           </button>
         </div>
@@ -125,7 +125,7 @@ async function kick(s: AdminSessionRow) {
             <span class="muted small">{{ t.idle }} {{ fmtIdle(s.idleMs) }}</span>
             <span class="muted small">{{ t.running }} {{ s.runningQueries.length }}</span>
             <span class="spacer" style="flex: 1" />
-            <button class="dbx-btn dbx-btn--danger" style="height: 20px; font-size: 11px" @click="kick(s)">
+            <button class="dbx-btn dbx-btn--danger" style="height: 20px; font-size: 11px" @click="pending = { kind: 'kick', id: s.id }">
               {{ t.kick }}
             </button>
           </div>
@@ -133,5 +133,14 @@ async function kick(s: AdminSessionRow) {
         </div>
       </template>
     </div>
+
+    <ConfirmDialog
+      v-if="pending"
+      :message="pending.kind === 'cancel' ? `${t.confirmCancelQuery} (${pending.id.slice(0, 12)}…)` : `${t.confirmKick} (${pending.id.slice(0, 12)}…)`"
+      :confirm-label="pending.kind === 'cancel' ? t.cancelQuery : t.kick"
+      danger
+      @ok="confirmPending"
+      @cancel="pending = null"
+    />
   </div>
 </template>
